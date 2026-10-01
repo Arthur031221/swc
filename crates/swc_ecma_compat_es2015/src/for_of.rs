@@ -2,7 +2,7 @@ use std::mem::take;
 
 use serde::Deserialize;
 use swc_atoms::atom;
-use swc_common::{util::take::Take, Mark, Spanned, SyntaxContext, DUMMY_SP};
+use swc_common::{util::take::Take, Mark, Span, Spanned, SyntaxContext, DUMMY_SP};
 use swc_ecma_ast::*;
 use swc_ecma_transforms_base::{
     helper,
@@ -73,10 +73,22 @@ struct ForOf {
     top_level_vars: Vec<VarDeclarator>,
 }
 
+/// Wraps `stmt` in `labels`, where `labels[0]` is the outermost label.
+fn wrap_labels(span: Span, labels: Vec<Ident>, stmt: Stmt) -> Stmt {
+    labels.into_iter().rev().fold(stmt, |body, label| {
+        LabeledStmt {
+            span,
+            label,
+            body: Box::new(body),
+        }
+        .into()
+    })
+}
+
 impl ForOf {
     fn fold_for_stmt(
         &mut self,
-        label: Option<Ident>,
+        labels: Vec<Ident>,
         ForOfStmt {
             span,
             left,
@@ -206,15 +218,7 @@ impl ForOf {
             }
             .into();
 
-            return match label {
-                Some(label) => LabeledStmt {
-                    span,
-                    label,
-                    body: Box::new(stmt),
-                }
-                .into(),
-                _ => stmt,
-            };
+            return wrap_labels(span, labels, stmt);
         }
 
         // Loose mode
@@ -328,15 +332,7 @@ impl ForOf {
                 body: Box::new(Stmt::Block(body)),
             }
             .into();
-            return match label {
-                Some(label) => LabeledStmt {
-                    span,
-                    label,
-                    body: Box::new(stmt),
-                }
-                .into(),
-                _ => stmt,
-            };
+            return wrap_labels(span, labels, stmt);
         }
 
         let var_span = left.span();
@@ -498,15 +494,7 @@ impl ForOf {
         }
         .into();
 
-        let for_stmt = match label {
-            Some(label) => LabeledStmt {
-                span,
-                label,
-                body: Box::new(for_stmt),
-            }
-            .into(),
-            None => for_stmt,
-        };
+        let for_stmt = wrap_labels(span, labels, for_stmt);
 
         TryStmt {
             span: DUMMY_SP,
@@ -697,22 +685,29 @@ impl VisitMut for ForOf {
     fn visit_mut_stmt(&mut self, s: &mut Stmt) {
         match s {
             Stmt::Labeled(LabeledStmt { label, body, .. }) => {
-                // Handle label
-                match &mut **body {
+                // Handle consecutive labels, e.g. `a: b: for (x of y) {}`
+                let mut labels = vec![label.clone()];
+                let mut inner = &mut **body;
+                while let Stmt::Labeled(LabeledStmt { label, body, .. }) = inner {
+                    labels.push(label.clone());
+                    inner = &mut **body;
+                }
+
+                match inner {
                     Stmt::ForOf(stmt) => {
                         stmt.visit_mut_children_with(self);
 
-                        *s = self.fold_for_stmt(Some(label.clone()), stmt.take());
+                        *s = self.fold_for_stmt(labels, stmt.take());
                     }
                     _ => {
-                        body.visit_mut_with(self);
+                        inner.visit_mut_with(self);
                     }
                 }
             }
             Stmt::ForOf(stmt) => {
                 stmt.visit_mut_children_with(self);
 
-                *s = self.fold_for_stmt(None, stmt.take())
+                *s = self.fold_for_stmt(Vec::new(), stmt.take())
             }
             _ => s.visit_mut_children_with(self),
         }
